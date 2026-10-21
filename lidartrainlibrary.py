@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scipy.ndimage import maximum_filter
+import torchvision.ops as ops
 
 from google.colab import drive
 drive.mount('/content/drive')
@@ -26,6 +27,7 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud, Box
 from nuscenes.eval.detection.utils import category_to_detection_name
 from nuscenes.utils.geometry_utils import points_in_box
+from scipy.spatial._qhull import QhullError
 
 from pyquaternion import Quaternion
 from objectron.dataset.iou import IoU as IoU3d
@@ -88,17 +90,18 @@ def get_pillars(cloud, voxel_size = 1, pillar_max = 100): #voxel_size is length 
   T = grid_shape[0]*grid_shape[1]
 
   N_counter = np.zeros(T)
+  
+  if pillar_max == None:
+    for k in range(cloud.shape[0]):
+      point = cloud[k]
 
-  for k in range(cloud.shape[0]):
-    point = cloud[k]
+      p_index = get_point_pillar(point, min_bound, voxel_size, grid_shape[0])
 
-    p_index = get_point_pillar(point, min_bound, voxel_size, grid_shape[0])
+      N_counter[p_index] += 1
 
-    N_counter[p_index] += 1
+    N = (np.max(N_counter)).astype(int)
 
-  N = (np.max(N_counter)).astype(int)
-
-  if pillar_max < N or pillar_max == None:
+  if pillar_max != None:
     N = pillar_max
 
   out = np.zeros((T, N, 5))
@@ -256,8 +259,8 @@ def target_generation(gt_boxes, heatmap_resolution = 256, threshold = 0.1, k =10
   box_ij = []
   box_wl = []
 
-  #x_min, y_min, x_max, y_max = pc_range
-  x_min, y_min, x_max, y_max, _, _ = get_boxes_max_min(gt_boxes)
+  x_min, y_min, x_max, y_max = pc_range
+  #x_min, y_min, x_max, y_max, _, _ = get_boxes_max_min(gt_boxes)
 
   for box in gt_boxes:
 
@@ -357,54 +360,6 @@ def loss_hm(heatmap, targetmap, alpha = 2, beta = 4):
       loss_hm += loss_ij
 
   return loss_hm * -1 /N
-
-class StageOneLoss(nn.Module):
-
-  def __init__(self, alpha = 2, beta = 4, lambda_reg = 0.25):
-    super(StageOneLoss, self).__init__()
-    self.alpha = alpha
-    self.beta = beta
-    self.lambda_reg = lambda_reg
-    self.l1loss = nn.L1Loss()
-
-  def forward(self, heatmap_input, reg_input, target_map, target_reg): #batched inputs for all
-
-    total_loss = 0
-
-    for j in range(heatmap_input.shape[0]):
-
-      heatmap_loss = loss_hm(heatmap_input[j], target_map[j], alpha = self.alpha, beta = self.beta)
-
-      reg_loss = self.l1loss(reg_input[j], target_reg[j])
-
-      reg_loss = reg_loss * self.lambda_reg
-
-      total_loss += heatmap_loss + reg_loss
-
-    total_loss = total_loss / input.shape[0]
-
-    return total_loss
-
-class StageTwoLoss(nn.Module):
-
-  def __init__(self):
-    super(StageTwoLoss, self).__init__()
-    self.l1_loss = nn.L1Loss()
-    self.smoothl1 = nn.SmoothL1Loss()
-
-  def forward(self, refine_input, I_input, refine_target, Iou_target):
-
-    total_loss = 0
-
-    for j in range(input.shape[0]):
-
-      offset_loss = self.l1loss(refine_input, refine_target)
-
-      confidence_loss = self.smoothl1(I_input, Iou_target)
-
-      total_loss += offset_loss + confidence_loss
-
-    return total_loss / input.shape[0]
 
 def get_samples(start, stop, nusc, dataroot):
   samples = []
@@ -525,8 +480,8 @@ def boxes_filter_pcrange(boxes, pc_range=[-51.2, 51.2]):
 
 def IoU(center_a0, center_b0):
 
-    center_a = center_a0.clone().detach().cpu()
-    center_b = center_b0.clone().detach().cpu()
+    center_a = center_a0.clone().detach().cpu().to(torch.float32)
+    center_b = center_b0.clone().detach().cpu().to(torch.float32)
 
     l_a, w_a, h_a = center_a[0], center_a[1], center_a[2]
     x_a, y_a, z_a = center_a[5], center_a[6], center_a[7]
@@ -550,7 +505,11 @@ def IoU(center_a0, center_b0):
 
     iou = IoU3d(box_a, box_b)
 
-    return iou.iou()
+    try:
+      return iou.iou()
+    except (QhullError, np.linalg.LinAlgError):
+      return 0.0  # degenerate intersection -> no meaningful overlap
+
 
 def boxes_to_tensor(boxes):
 
@@ -568,3 +527,29 @@ def boxes_to_tensor(boxes):
   boxes_tensor = torch.stack(boxes_tensor)
 
   return boxes_tensor
+
+def IoU2(centers_a, centers_b):
+  l_a , w_a = centers_a[:, 0].clamp(-4, 4).exp().clamp(min=0.1), centers_a[:, 1].clamp(-4, 4).exp().clamp(min=0.1)
+  yaw_a = torch.atan2(centers_a[:, 3], centers_a[:, 4])
+  cos_a, sin_a = yaw_a.cos().abs(), yaw_a.sin().abs()
+
+  hx_a = 0.5 * (l_a * cos_a + w_a * sin_a)
+  hy_a = 0.5 * (l_a * sin_a + w_a * cos_a)
+
+  cx_a, cy_a = centers_a[:, 5], centers_a[:, 6]
+  bev_coords_a = torch.stack([cx_a-hx_a, cy_a-hy_a, cx_a+hx_a, cy_a+hy_a], dim = 1)
+
+  l_b, w_b = centers_b[:, 0].clamp(-4, 4).exp().clamp(min=0.1), centers_b[:, 1].clamp(-4, 4).exp().clamp(min=0.1)
+  yaw_b = torch.atan2(centers_b[:, 3], centers_b[:, 4])
+  cos_b, sin_b = yaw_b.cos().abs(), yaw_b.sin().abs()
+
+  hx_b = 0.5 * (l_b * cos_b + w_b * sin_b)
+  hy_b = 0.5 * (l_b * sin_b + w_b * cos_b)
+
+  cx_b, cy_b = centers_b[:, 5], centers_b[:, 6]
+  bev_coords_b = torch.stack([cx_b-hx_b, cy_b-hy_b, cx_b+hx_b, cy_b+hy_b], dim = 1)
+
+  iou_matrix = ops.box_iou(bev_coords_a, bev_coords_b)
+
+  return iou_matrix
+
